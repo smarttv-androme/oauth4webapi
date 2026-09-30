@@ -329,6 +329,31 @@ export const clockSkew: unique symbol = Symbol()
 export const clockTolerance: unique symbol = Symbol()
 
 /**
+ * Skips the JWT `aud` (audience) claim value check against
+ * {@link Client.client_id `client.client_id`}.
+ *
+ * > [!WARNING]\
+ * > This option has security implications that must be understood, assessed for applicability, and
+ * > accepted before use.
+ *
+ * When set to `true` on a {@link Client} this skips the `aud` claim value check (as well as the ID
+ * Token `azp` claim value check) for ID Tokens, JWT UserInfo responses, JWT Introspection
+ * responses, and JWT Secured Authorization Responses (JARM). The claims are still required to be
+ * present where applicable.
+ *
+ * @example
+ *
+ * ```ts
+ * let client: oauth.Client = {
+ *   client_id: 'abc4ba37-4ab8-49b5-99d4-9441ba35d428',
+ *   // ... other metadata
+ *   [oauth.skipAudienceCheck]: true,
+ * }
+ * ```
+ */
+export const skipAudienceCheck: unique symbol = Symbol()
+
+/**
  * Overrides the Fetch API implementation used for outbound HTTP requests.
  *
  * When configured on an interface that extends {@link HttpRequestOptions}, this applies to the
@@ -1062,6 +1087,11 @@ export interface Client {
    * See {@link clockTolerance}.
    */
   [clockTolerance]?: number
+
+  /**
+   * See {@link skipAudienceCheck}.
+   */
+  [skipAudienceCheck]?: boolean
 
   [metadata: string]: JsonValue | undefined
 }
@@ -1834,6 +1864,10 @@ function getClockTolerance(client?: Pick<Client, typeof clockTolerance>) {
   return typeof tolerance === 'number' && Number.isFinite(tolerance) && Math.sign(tolerance) !== -1
     ? tolerance
     : 30
+}
+
+function getExpectedAudience(client: Client): string | typeof skipAudienceCheck {
+  return client[skipAudienceCheck] === true ? skipAudienceCheck : client.client_id
 }
 
 /**
@@ -3556,7 +3590,7 @@ export async function processUserInfoResponse(
       getClockTolerance(client),
       options?.[jweDecrypt],
     )
-      .then(validateOptionalAudience.bind(undefined, client.client_id))
+      .then(validateOptionalAudience.bind(undefined, getExpectedAudience(client)))
       .then(validateOptionalIssuer.bind(undefined, as))
 
     jwtRefs.set(response, jwt)
@@ -3930,7 +3964,7 @@ export async function processRefreshTokenResponse(
 }
 
 function validateOptionalAudience(
-  expected: string,
+  expected: string | typeof skipAudienceCheck,
   result: Awaited<ReturnType<typeof validateJwt>>,
 ) {
   if (result.claims.aud !== undefined) {
@@ -3939,7 +3973,14 @@ function validateOptionalAudience(
   return result
 }
 
-function validateAudience(expected: string, result: Awaited<ReturnType<typeof validateJwt>>) {
+function validateAudience(
+  expected: string | typeof skipAudienceCheck,
+  result: Awaited<ReturnType<typeof validateJwt>>,
+) {
+  if (expected === skipAudienceCheck) {
+    return result
+  }
+
   if (Array.isArray(result.claims.aud)) {
     if (!result.claims.aud.includes(expected)) {
       throw OPE('unexpected JWT "aud" (audience) claim value', JWT_CLAIM_COMPARISON, {
@@ -4185,7 +4226,7 @@ function validateIdTokenClaims(
   )
     .then(validatePresence.bind(undefined, ['aud', 'exp', 'iat', 'iss', 'sub', ...requiredClaims]))
     .then(validateIssuer.bind(undefined, as))
-    .then(validateAudience.bind(undefined, client.client_id))
+    .then(validateAudience.bind(undefined, getExpectedAudience(client)))
     .then(validateStringClaim.bind(undefined, 'sub'))
 }
 
@@ -4238,7 +4279,13 @@ function validateIdTokenAuthTime(
   }
 }
 
-function validateIdTokenNonce(claims: JWTPayload, expectedNonce: string | typeof expectNoNonce) {
+function validateIdTokenNonce(
+  claims: JWTPayload,
+  expectedNonce: string | typeof expectNoNonce | typeof skipNonceCheck,
+) {
+  if (expectedNonce === skipNonceCheck) {
+    return
+  }
   const expected = expectedNonce === expectNoNonce ? undefined : expectedNonce
   if (claims.nonce !== expected) {
     throw OPE('unexpected ID Token "nonce" claim value', JWT_CLAIM_COMPARISON, {
@@ -4250,6 +4297,9 @@ function validateIdTokenNonce(claims: JWTPayload, expectedNonce: string | typeof
 }
 
 function validateIdTokenAuthorizedParty(client: Client, claims: JWTPayload) {
+  if (getExpectedAudience(client) === skipAudienceCheck) {
+    return
+  }
   if (Array.isArray(claims.aud) && claims.aud.length !== 1) {
     if (claims.azp === undefined) {
       throw OPE(
@@ -4312,6 +4362,20 @@ export interface TokenEndpointResponse {
 export const expectNoNonce: unique symbol = Symbol()
 
 /**
+ * Skips the ID Token `nonce` claim value check.
+ *
+ * > [!WARNING]\
+ * > This option has security implications that must be understood, assessed for applicability, and
+ * > accepted before use.
+ *
+ * Use this as the {@link processAuthorizationCodeResponse} `expectedNonce` option value, or as the
+ * {@link validateCodeIdTokenResponse} / {@link validateDetachedSignatureResponse} `expectedNonce`
+ * argument value, to skip the `nonce` claim value check. The claim is then neither required to be
+ * present nor compared to any value.
+ */
+export const skipNonceCheck: unique symbol = Symbol()
+
+/**
  * Skips validation of the ID Token `auth_time` claim.
  *
  * Use this as the {@link processAuthorizationCodeResponse} `oidc.maxAge` value.
@@ -4323,9 +4387,10 @@ export const skipAuthTimeCheck: unique symbol = Symbol()
  */
 export interface ProcessAuthorizationCodeResponseOptions extends ProcessTokenResponseOptions {
   /**
-   * Expected ID Token `nonce` claim value. Default is {@link expectNoNonce}.
+   * Expected ID Token `nonce` claim value. Default is {@link expectNoNonce}. Use
+   * {@link skipNonceCheck} to skip the `nonce` claim value check.
    */
-  expectedNonce?: string | typeof expectNoNonce
+  expectedNonce?: string | typeof expectNoNonce | typeof skipNonceCheck
   /**
    * ID Token {@link IDToken.auth_time `auth_time`} claim value will be checked to be present and
    * conform to the `maxAge` value. Use of this option is required if you sent a `max_age` parameter
@@ -4385,6 +4450,7 @@ export async function processAuthorizationCodeResponse(
     as,
     client,
     response,
+    options?.expectedNonce === skipNonceCheck ? skipNonceCheck : expectNoNonce,
     options?.maxAge,
     options?.[jweDecrypt],
     options?.recognizedTokenTypes,
@@ -4395,7 +4461,7 @@ async function processAuthorizationCodeOpenIDResponse(
   as: AuthorizationServer,
   client: Client,
   response: Response,
-  expectedNonce: string | typeof expectNoNonce | undefined,
+  expectedNonce: string | typeof expectNoNonce | typeof skipNonceCheck | undefined,
   maxAge: number | typeof skipAuthTimeCheck | undefined,
   decryptFn: JweDecryptFunction | undefined,
   recognizedTokenTypes: RecognizedTokenTypes | undefined,
@@ -4407,6 +4473,7 @@ async function processAuthorizationCodeOpenIDResponse(
       expectedNonce = expectNoNonce
       break
     case expectNoNonce:
+    case skipNonceCheck:
       break
     default:
       assertString(expectedNonce, '"expectedNonce" argument')
@@ -4442,6 +4509,7 @@ async function processAuthorizationCodeOAuth2Response(
   as: AuthorizationServer,
   client: Client,
   response: Response,
+  expectedNonce: typeof expectNoNonce | typeof skipNonceCheck,
   maxAge: number | typeof skipAuthTimeCheck | undefined,
   decryptFn: JweDecryptFunction | undefined,
   recognizedTokenTypes: RecognizedTokenTypes | undefined,
@@ -4458,7 +4526,7 @@ async function processAuthorizationCodeOAuth2Response(
   const claims = getValidatedIdTokenClaims(result)
   if (claims) {
     validateIdTokenAuthTime(client, claims, resolveIdTokenMaxAge(client, maxAge))
-    validateIdTokenNonce(claims, expectNoNonce)
+    validateIdTokenNonce(claims, expectedNonce)
   }
 
   return result
@@ -5028,7 +5096,7 @@ export async function processIntrospectionResponse(
       .then(checkJwtType.bind(undefined, 'token-introspection+jwt'))
       .then(validatePresence.bind(undefined, ['aud', 'iat', 'iss']))
       .then(validateIssuer.bind(undefined, as))
-      .then(validateAudience.bind(undefined, client.client_id))
+      .then(validateAudience.bind(undefined, getExpectedAudience(client)))
 
     jwtRefs.set(response, jwt)
     if (!isJsonObject(claims.token_introspection)) {
@@ -5434,7 +5502,7 @@ export async function validateJwtAuthResponse(
   )
     .then(validatePresence.bind(undefined, ['aud', 'exp', 'iss']))
     .then(validateIssuer.bind(undefined, as))
-    .then(validateAudience.bind(undefined, client.client_id))
+    .then(validateAudience.bind(undefined, getExpectedAudience(client)))
 
   const { 0: protectedHeader, 1: payload, 2: encodedSignature } = jwt.split('.')
 
@@ -5515,7 +5583,8 @@ async function idTokenHashMatches(
  * @param client Client Metadata.
  * @param parameters Authorization Response parameters as URLSearchParams, instance of URL with
  *   parameters in a fragment/hash, or a `form_post` Request instance.
- * @param expectedNonce Expected ID Token `nonce` claim value.
+ * @param expectedNonce Expected ID Token `nonce` claim value. Use {@link skipNonceCheck} to skip the
+ *   `nonce` claim value check.
  * @param expectedState Expected `state` parameter value. Default is {@link expectNoState}.
  * @param maxAge ID Token {@link IDToken.auth_time `auth_time`} claim value will be checked to be
  *   present and conform to the `maxAge` value. Use of this option is required if you sent a
@@ -5534,7 +5603,7 @@ export async function validateDetachedSignatureResponse(
   as: AuthorizationServer,
   client: Client,
   parameters: URLSearchParams | URL | Request,
-  expectedNonce: string,
+  expectedNonce: string | typeof skipNonceCheck,
   expectedState?: string | typeof expectNoState,
   maxAge?: number | typeof skipAuthTimeCheck,
   options?: ValidateSignatureOptions & JWEDecryptOptions,
@@ -5558,7 +5627,8 @@ export async function validateDetachedSignatureResponse(
  * @param client Client Metadata.
  * @param parameters Authorization Response parameters as URLSearchParams, instance of URL with
  *   parameters in a fragment/hash, or a `form_post` Request instance.
- * @param expectedNonce Expected ID Token `nonce` claim value.
+ * @param expectedNonce Expected ID Token `nonce` claim value. Use {@link skipNonceCheck} to skip the
+ *   `nonce` claim value check.
  * @param expectedState Expected `state` parameter value. Default is {@link expectNoState}.
  * @param maxAge ID Token {@link IDToken.auth_time `auth_time`} claim value will be checked to be
  *   present and conform to the `maxAge` value. Use of this option is required if you sent a
@@ -5578,7 +5648,7 @@ export async function validateCodeIdTokenResponse(
   as: AuthorizationServer,
   client: Client,
   parameters: URLSearchParams | URL | Request,
-  expectedNonce: string,
+  expectedNonce: string | typeof skipNonceCheck,
   expectedState?: string | typeof expectNoState,
   maxAge?: number | typeof skipAuthTimeCheck,
   options?: ValidateSignatureOptions & JWEDecryptOptions,
@@ -5640,7 +5710,7 @@ async function validateHybridResponse(
   as: AuthorizationServer,
   client: Client,
   parameters: URLSearchParams | URL | Request,
-  expectedNonce: string,
+  expectedNonce: string | typeof skipNonceCheck,
   expectedState: string | typeof expectNoState | undefined,
   maxAge: number | typeof skipAuthTimeCheck | undefined,
   options: (ValidateSignatureOptions & JWEDecryptOptions) | undefined,
@@ -5697,7 +5767,10 @@ async function validateHybridResponse(
     throw OPE('"parameters" does not contain an Authorization Code', INVALID_RESPONSE)
   }
 
-  const requiredClaims: (keyof typeof jwtClaimNames)[] = ['nonce', 'c_hash']
+  const requiredClaims: (keyof typeof jwtClaimNames)[] = ['c_hash']
+  if (expectedNonce !== skipNonceCheck) {
+    requiredClaims.push('nonce')
+  }
 
   const state = parameters.get('state')
   if (fapi && (typeof expectedState === 'string' || state !== null)) {
@@ -5734,7 +5807,9 @@ async function validateHybridResponse(
   validateIdTokenAuthTimeClaim(claims)
   validateIdTokenAuthTime(client, claims, maxAge)
 
-  assertString(expectedNonce, '"expectedNonce" argument')
+  if (expectedNonce !== skipNonceCheck) {
+    assertString(expectedNonce, '"expectedNonce" argument')
+  }
 
   validateIdTokenNonce(claims, expectedNonce)
   validateIdTokenAuthorizedParty(client, claims)
